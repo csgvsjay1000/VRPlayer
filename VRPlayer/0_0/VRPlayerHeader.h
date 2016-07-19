@@ -20,6 +20,9 @@
 #define TAG_TYPE_AUDIO  8
 #define TAG_TYPE_VIDEO  9
 
+#define VIDEO_PICTURE_QUEUE_SIZE 1
+
+
 //Important!
 #pragma pack(1)
 
@@ -59,7 +62,9 @@ typedef struct PacketQueue{
 }PacketQueue;
 
 static void packet_queue_init(PacketQueue *q){
+//    q = malloc(sizeof(PacketQueue));
     memset(q, 0, sizeof(PacketQueue));
+
     pthread_mutex_init(&q->mutex, NULL);
     pthread_cond_init(&q->cond, NULL);
 }
@@ -117,6 +122,7 @@ static int packet_queue_get(PacketQueue *q,AVPacket *pkt,int block){
             outtime.tv_sec = now.tv_sec + 10;
             outtime.tv_nsec = now.tv_usec * 1000;
             pthread_cond_timedwait(&q->cond, &q->mutex, &outtime);
+//            pthread_cond_wait(&q->cond, &q->mutex);
             break;
         }
     }
@@ -125,16 +131,26 @@ static int packet_queue_get(PacketQueue *q,AVPacket *pkt,int block){
     return ret;
 }
 
-typedef struct VideoState{
+typedef struct VideoPicture{
+    CVPixelBufferRef pixel;
     
-    pthread_mutex_t pictq_mutex;
-    pthread_cond_t pictq_cond;
+}VideoPicture;
+
+typedef struct VideoState{
     
     int video_stream;
     PacketQueue videoq;
     
     int audio_stream;
     PacketQueue audioq;
+    
+    int video_width,video_height;
+    
+    int pictq_size, pictq_rindex, pictq_windex;
+    VideoPicture pictq[VIDEO_PICTURE_QUEUE_SIZE];
+    
+    pthread_mutex_t pictq_mutex;
+    pthread_cond_t pictq_cond;
     
 }VideoState;
 

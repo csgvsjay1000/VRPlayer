@@ -10,9 +10,17 @@
 #import "AAPLEAGLLayer.h"
 #import "VRPlayerHeader.h"
 #import "KBPlayerEnumHeaders.h"
+#import <VideoToolbox/VideoToolbox.h>
 
 @interface VRPlayer (){
     FILE *_file;
+    
+    uint8_t *_sps;
+    NSInteger _spsSize;
+    uint8_t *_pps;
+    NSInteger _ppsSize;
+    VTDecompressionSessionRef _deocderSession;
+    CMVideoFormatDescriptionRef _decoderFormatDescription;
 }
 
 @property(nonatomic,strong)AAPLEAGLLayer *appleGLLayer;
@@ -24,6 +32,7 @@
 @property(nonatomic,strong)NSThread *videoThread;
 @property(nonatomic,strong)NSThread *audioThread;
 @property(nonatomic,assign)KBPlayerPlayingState playingState;  //播放状态
+@property(nonatomic,strong)NSTimer *timer;
 
 
 @end
@@ -70,11 +79,7 @@
     _is->audio_stream = -1;
     _is->video_stream = -1;
     
-    int bufSize = 512;
-    uint8_t *buf = malloc(sizeof(uint8_t)*bufSize);
-    
     _file = fopen([_urlStr UTF8String], "rb");
-//    fread(buf, sizeof(uint8_t), bufSize, _file);
     FLV_HEADER flv_header = [self flv_prob];
     //存在音频
     if (flv_header.Flags>>2 == 1) {
@@ -95,7 +100,13 @@
     packet=(AVPacket *)malloc(sizeof(AVPacket));
     
     fseek(_file, CFSwapInt32BigToHost(flv_header.DataOffset), SEEK_SET);
-
+    VideoPicture *vp = malloc(sizeof(VideoPicture));
+    
+    _is->pictq[0] = *vp;
+    _is->pictq_windex = 0;
+    _is->pictq_rindex = 0;
+    _is->pictq_size = 0;
+    
     for (; ; ) {
         if (_is->videoq.size > MAX_VIDEOQ_SIZE) {
             printf(" videoq.size %d\n",_is->videoq.size);
@@ -108,7 +119,7 @@
                 packet_queue_put(&_is->videoq, packet);
             }else if (packet->stream_index == _is->audio_stream){
                 printf(" audio.size %d\n",packet->size);
-//                packet_queue_put(&_is->, packet);
+//                packet_queue_put(&_is->audioq, packet);
             }
         }else{
             break;
@@ -174,17 +185,141 @@
 
 -(void)playVideoThread{
     
+    AVPacket pkt1, *packet = &pkt1;
+    
+    for (; ; ) {
+        if (packet_queue_get(&_is->videoq, packet, 1) < 0) {
+            // means we quit getting packets
+            continue;
+        }
+        CVPixelBufferRef pixel = [self decode:packet];
+        [self queue_picture:pixel];
+    }
+    
 }
+
+
 
 -(void)playAudioThread{
     
 }
 
--(void)schedule_refresh:(int)delay{
-    
-    
-
+-(int)queue_picture:(CVPixelBufferRef)pixel{
+    VideoPicture *vp;
+    vp = &_is->pictq[_is->pictq_windex];
+    pthread_mutex_lock(&_is->pictq_mutex);
+    while (_is->pictq_size>=VIDEO_PICTURE_QUEUE_SIZE) {
+        pthread_cond_wait(&_is->pictq_cond, &_is->pictq_mutex);
+    }
+    pthread_mutex_unlock(&_is->pictq_mutex);
+    if (++_is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
+        _is->pictq_windex = 0;
+    }
+    vp->pixel = pixel;
+    pthread_mutex_lock(&_is->pictq_mutex);
+    _is->pictq_size++;
+    pthread_mutex_unlock(&_is->pictq_mutex);
+    return 0;
 }
+
+-(CVPixelBufferRef)decode:(AVPacket *)packet{
+    
+    [self initH264Decoder:packet];
+    
+    CVPixelBufferRef outputPixelBuffer = NULL;
+    CMBlockBufferRef blockBuffer = NULL;
+    OSStatus status  = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, packet->data, packet->size, kCFAllocatorNull, NULL, 0, packet->size, 0, &blockBuffer);
+    
+    return outputPixelBuffer;
+}
+
+-(void)schedule_refresh:(int)delay{
+    if (_timer) {
+        [_timer invalidate];
+    }
+    _timer = [NSTimer scheduledTimerWithTimeInterval:delay/1000.0 target:self selector:@selector(video_refresh_timer) userInfo:nil repeats:YES];
+}
+
+-(void)video_refresh_timer{
+    VideoPicture *vp;
+    vp = &_is->pictq[_is->pictq_rindex];
+    if (_is->pictq_size>0) {
+        [self video_display:vp];
+        
+        if (++_is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
+            _is->pictq_rindex = 0;
+        }
+        pthread_mutex_lock(&_is->pictq_mutex);
+        _is->pictq_size--;
+        pthread_cond_signal(&_is->pictq_cond);
+        pthread_mutex_unlock(&_is->pictq_mutex);
+    }
+}
+
+-(void)video_display:(VideoPicture *)vp{
+    _appleGLLayer.pixelBuffer = vp->pixel;
+}
+
+#pragma mark - decode h264
+static void didDecompress( void *decompressionOutputRefCon, void *sourceFrameRefCon, OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef pixelBuffer, CMTime presentationTimeStamp, CMTime presentationDuration ){
+
+    CVPixelBufferRef *outputPixelBuffer = (CVPixelBufferRef *)sourceFrameRefCon;
+    *outputPixelBuffer = CVPixelBufferRetain(pixelBuffer);
+}
+
+-(BOOL)initH264Decoder:(AVPacket *)packet{
+    
+    uint8_t *buf = packet->data;
+    
+    if (buf[1] == 0) {
+        // AVCDecoderConfigurationRecord（AVC sequence header）
+        OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 1, buf+3, packet->size-4, 0, &_decoderFormatDescription);
+        if(status == noErr) {
+            
+            NSDictionary* destinationPixelBufferAttributes = @{
+                                                               (id)kCVPixelBufferPixelFormatTypeKey : [NSNumber numberWithInt:kCVPixelFormatType_420YpCbCr8BiPlanarFullRange],
+                                                               //硬解必须是 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                                                               //                                                           或者是kCVPixelFormatType_420YpCbCr8Planar
+                                                               //因为iOS是  nv12  其他是nv21
+                                                               (id)kCVPixelBufferWidthKey : [NSNumber numberWithInt:512*2],
+                                                               (id)kCVPixelBufferHeightKey : [NSNumber numberWithInt:288*2],
+                                                               //这里款高和编码反的
+                                                               (id)kCVPixelBufferOpenGLCompatibilityKey : [NSNumber numberWithBool:YES]
+                                                               };
+            VTDecompressionOutputCallbackRecord callBackRecord;
+            callBackRecord.decompressionOutputCallback = didDecompress;
+            callBackRecord.decompressionOutputRefCon = (__bridge void *)self;
+            status = VTDecompressionSessionCreate(kCFAllocatorDefault,
+                                                  _decoderFormatDescription,
+                                                  NULL,
+                                                  (__bridge CFDictionaryRef)destinationPixelBufferAttributes,
+                                                  &callBackRecord,
+                                                  &_deocderSession);
+            VTSessionSetProperty(_deocderSession, kVTDecompressionPropertyKey_ThreadCount, (__bridge CFTypeRef)[NSNumber numberWithInt:1]);
+            VTSessionSetProperty(_deocderSession, kVTDecompressionPropertyKey_RealTime, kCFBooleanTrue);
+
+        } else {
+            NSLog(@"IOS8VT: reset decoder session failed status=%d", status);
+        }
+        
+        return YES;
+        
+    }else if (buf[1] == 1){
+        // One or more NALUs
+        
+    }
+    
+    if(_deocderSession) {
+        //        [self clearH264Deocder];
+        return YES;
+    }
+    
+    
+    
+    
+    return YES;
+}
+
 
 #pragma mark - private methods
 -(FLV_HEADER)flv_prob{
