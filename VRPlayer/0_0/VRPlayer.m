@@ -12,7 +12,14 @@
 #import "KBPlayerEnumHeaders.h"
 #import <VideoToolbox/VideoToolbox.h>
 
-@interface VRPlayer (){
+@protocol H264HwDecoderImplDelegate <NSObject>
+
+- (void)displayDecodedFrame:(CVImageBufferRef )imageBuffer;
+
+
+@end
+
+@interface VRPlayer ()<H264HwDecoderImplDelegate>{
     FILE *_file;
     
     uint8_t *_sps;
@@ -59,7 +66,7 @@
     _is = malloc(sizeof(VideoState));
     pthread_mutex_init(&_is->pictq_mutex, NULL);
     pthread_cond_init(&_is->pictq_cond, NULL);
-    [self schedule_refresh:40];
+    [self schedule_refresh:70];
     _read_tid = [[NSThread alloc] initWithTarget:self selector:@selector(read_thread) object:nil];
     _read_tid.name = @"com.3glasses.vrshow.read";
     [_read_tid start];
@@ -115,10 +122,10 @@
         }
         if ([self av_read_frame:packet]>=0) {
             if (packet->stream_index == _is->video_stream) {
-                printf(" video.size %d\n",packet->size);
+//                printf(" video.pts %lld\n",packet->pts);
                 packet_queue_put(&_is->videoq, packet);
             }else if (packet->stream_index == _is->audio_stream){
-                printf(" audio.size %d\n",packet->size);
+//                printf(" audio.size %d\n",packet->size);
 //                packet_queue_put(&_is->audioq, packet);
             }
         }else{
@@ -135,13 +142,13 @@
     TAG_HEADER tagheader;
     fread((void *)&tagheader,sizeof(TAG_HEADER),1,_file);
     int tagheader_datasize=tagheader.DataSize[0]*65536+tagheader.DataSize[1]*256+tagheader.DataSize[2];
-    int tagheader_timestamp=tagheader.Timestamp[0]*65536+tagheader.Timestamp[1]*256+tagheader.Timestamp[2];
+//    int tagheader_timestamp=tagheader.Timestamp[0]*65536+tagheader.Timestamp[1]*256+tagheader.Timestamp[2];
     packet->stream_index = tagheader.TagType;
     
     packet->data = malloc(tagheader_datasize);
     size_t read_size = fread(packet->data, sizeof(uint8_t), tagheader_datasize, _file);
     packet->size = read_size;
-    packet->pts = tagheader_timestamp;
+    packet->pts = ((tagheader.Timestamp[0]<<8|tagheader.Timestamp[1])<<8|tagheader.Timestamp[2])|tagheader.TimestampExtended<<24;
     if (read_size == tagheader_datasize) {
         
     }else if (read_size<=0){
@@ -192,8 +199,15 @@
             // means we quit getting packets
             continue;
         }
-        CVPixelBufferRef pixel = [self decode:packet];
-        [self queue_picture:pixel];
+        
+        if (_deocderSession) {
+            CVPixelBufferRef pixel = [self decode:packet];
+//            [self queue_picture:pixel];
+        }else{
+            [self initH264Decoder:packet];
+        }
+        
+        
     }
     
 }
@@ -224,11 +238,52 @@
 
 -(CVPixelBufferRef)decode:(AVPacket *)packet{
     
-    [self initH264Decoder:packet];
-    
     CVPixelBufferRef outputPixelBuffer = NULL;
     CMBlockBufferRef blockBuffer = NULL;
-    OSStatus status  = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, packet->data, packet->size, kCFAllocatorNull, NULL, 0, packet->size, 0, &blockBuffer);
+    
+    uint8_t *buf = packet->data+5;
+    int dataSize = packet->size - 5;
+    
+    OSStatus status  = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, buf, dataSize, kCFAllocatorNull, NULL, 0,dataSize, 0, &blockBuffer);
+    if(status == kCMBlockBufferNoErr) {
+        CMSampleBufferRef sampleBuffer = NULL;
+        const size_t sampleSizeArray[] = {dataSize};
+        
+        int32_t timeSpan = 1000;
+        CMTime PTime = CMTimeMake(packet->pts, timeSpan);
+        CMSampleTimingInfo timingInfo;
+        timingInfo.presentationTimeStamp = PTime;
+        timingInfo.duration =  kCMTimeZero;
+        timingInfo.decodeTimeStamp = kCMTimeInvalid;
+        
+        status = CMSampleBufferCreateReady(kCFAllocatorDefault,
+                                           blockBuffer,
+                                           _decoderFormatDescription ,
+                                           1, 1, &timingInfo, 1, sampleSizeArray,
+                                           &sampleBuffer);
+        
+        if (status == kCMBlockBufferNoErr && sampleBuffer) {
+            
+            VTDecodeFrameFlags flags = 0;
+            VTDecodeInfoFlags flagOut = 0;
+            OSStatus decodeStatus = VTDecompressionSessionDecodeFrame(_deocderSession,
+                                                                      sampleBuffer,
+                                                                      flags,
+                                                                      &outputPixelBuffer,
+                                                                      &flagOut);
+            
+            if(decodeStatus == kVTInvalidSessionErr) {
+                NSLog(@"IOS8VT: Invalid session, reset decoder session");
+            } else if(decodeStatus == kVTVideoDecoderBadDataErr) {
+                NSLog(@"IOS8VT: decode failed status=%d(Bad data)", decodeStatus);
+            } else if(decodeStatus != noErr) {
+                NSLog(@"IOS8VT: decode failed status=%d", decodeStatus);
+            }
+            
+            CFRelease(sampleBuffer);
+        }
+        CFRelease(blockBuffer);
+    }
     
     return outputPixelBuffer;
 }
@@ -260,27 +315,60 @@
     _appleGLLayer.pixelBuffer = vp->pixel;
 }
 
+- (void)displayDecodedFrame:(CVImageBufferRef )imageBuffer{
+    [self queue_picture:imageBuffer];
+}
+
 #pragma mark - decode h264
 static void didDecompress( void *decompressionOutputRefCon, void *sourceFrameRefCon, OSStatus status, VTDecodeInfoFlags infoFlags, CVImageBufferRef pixelBuffer, CMTime presentationTimeStamp, CMTime presentationDuration ){
+    
+    float videoDurationSeconds = CMTimeGetSeconds(presentationTimeStamp);
+    float videoDurationDuration = CMTimeGetSeconds(presentationDuration);
 
+    printf("videoDurationSeconds  %f   presentationDuration %f\n",videoDurationSeconds,videoDurationDuration);
+    
     CVPixelBufferRef *outputPixelBuffer = (CVPixelBufferRef *)sourceFrameRefCon;
     *outputPixelBuffer = CVPixelBufferRetain(pixelBuffer);
+    VRPlayer *decoder = (__bridge VRPlayer *)decompressionOutputRefCon;
+    [decoder displayDecodedFrame:pixelBuffer];
 }
 
 -(BOOL)initH264Decoder:(AVPacket *)packet{
     
-    uint8_t *buf = packet->data;
+    if(_deocderSession) {
+        //        [self clearH264Deocder];
+        return YES;
+    }
     
+    uint8_t *buf = packet->data;
+    uint8_t *buf2 = buf+5;
     if (buf[1] == 0) {
         // AVCDecoderConfigurationRecord（AVC sequence header）
-        OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 1, buf+3, packet->size-4, 0, &_decoderFormatDescription);
+        int naluLength = buf2[4]&0x03+1;
+        int spsNum = buf2[5]&0x1F;
+        int spsSize = buf2[7];
+        uint8_t *sps = malloc(spsSize);
+        memcpy(sps, buf2+8, spsSize);
+        
+        uint8_t *buf3 = buf2+8+spsSize;
+        
+        int ppsNum = buf3[0];
+        int ppsSize = buf3[2];
+        uint8_t *pps = malloc(ppsSize);
+        memcpy(pps, buf3+3, ppsSize);
+        
+        const uint8_t* const parameterSetPointers[2] = { sps, pps };
+        const size_t parameterSetSizes[2] = { spsSize, ppsSize };
+        
+        
+        OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, 2,parameterSetPointers,parameterSetSizes, naluLength, &_decoderFormatDescription);
         if(status == noErr) {
             
             NSDictionary* destinationPixelBufferAttributes = @{
                                                                (id)kCVPixelBufferPixelFormatTypeKey : [NSNumber numberWithInt:kCVPixelFormatType_420YpCbCr8BiPlanarFullRange],
                                                                //硬解必须是 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                                                                //                                                           或者是kCVPixelFormatType_420YpCbCr8Planar
-                                                               //因为iOS是  nv12  其他是nv21
+                                                               //因为iOS是  nv12  其他是nv21  288  512
                                                                (id)kCVPixelBufferWidthKey : [NSNumber numberWithInt:512*2],
                                                                (id)kCVPixelBufferHeightKey : [NSNumber numberWithInt:288*2],
                                                                //这里款高和编码反的
@@ -308,14 +396,6 @@ static void didDecompress( void *decompressionOutputRefCon, void *sourceFrameRef
         // One or more NALUs
         
     }
-    
-    if(_deocderSession) {
-        //        [self clearH264Deocder];
-        return YES;
-    }
-    
-    
-    
     
     return YES;
 }

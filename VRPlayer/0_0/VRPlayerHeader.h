@@ -50,7 +50,8 @@ typedef struct {
     Byte TagType;
     Byte DataSize[3];
     Byte Timestamp[3];
-    uint Reserved;
+    Byte TimestampExtended;
+    Byte Reserved[3];
 } TAG_HEADER;
 
 typedef struct PacketQueue{

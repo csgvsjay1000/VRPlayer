@@ -27,6 +27,10 @@
 - (void)testExample {
     // This is an example of a functional test case.
     // Use XCTAssert and related functions to verify your tests produce the correct results.
+    
+    uint8_t buf[2] = {0x00,0x19};
+    printf("\n---------%d---------\n",buf[1]);
+    
 }
 
 - (void)testPerformanceExample {
