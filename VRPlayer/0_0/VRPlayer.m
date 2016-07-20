@@ -28,6 +28,9 @@
     NSInteger _ppsSize;
     VTDecompressionSessionRef _deocderSession;
     CMVideoFormatDescriptionRef _decoderFormatDescription;
+    
+    
+    int i_frame_counter;
 }
 
 @property(nonatomic,strong)AAPLEAGLLayer *appleGLLayer;
@@ -132,6 +135,25 @@
             break;
         }
     }
+    
+}
+
+-(void)caulatePts:(AVPacket *)packet{
+    uint8_t *buf = packet->data;
+    int dataSize = packet->size;
+    
+    int FrameType = (buf[0]>>4)&0x0f;
+    if (FrameType == 1) {
+        //key frame;
+        i_frame_counter = 0;
+        printf("%d I key frame \n",i_frame_counter);
+        
+    }else{
+        i_frame_counter++;
+        printf("%d B/P frame \n",i_frame_counter);
+        
+    }
+    
     
 }
 
