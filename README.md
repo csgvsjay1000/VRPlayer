@@ -5,5 +5,6 @@
 
 目前待解决问题，解码h264前，先根据pts排序，目前获取每一帧的pts有困难。
 根据高人指点，pts应该是从flv中获取。
+
 ds = tagheader的时间戳
 pts = ds + CompositionTime
